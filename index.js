@@ -28,7 +28,7 @@ app.use(express.urlencoded({ extended: true }));
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+  limits: { fileSize: 1000 * 1024 * 1024 } // 100MB limit
 });
 
 // Create temp directory for file uploads if it doesn't exist
