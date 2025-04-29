@@ -1936,8 +1936,8 @@ function generateHTML(accountList, allFiles) {
               }
               
               // Check file size (limit to 100MB for simplicity)
-              if (file.size > 100 * 1024 * 1024) {
-                  showError('File size exceeds 100MB limit. Please choose a smaller file.');
+              if (file.size > 1000 * 1024 * 1024) {
+                  showError('File size exceeds 1000MB limit. Please choose a smaller file.');
                   return;
               }
               
