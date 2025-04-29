@@ -1,8 +1,3 @@
-/**
- * Multi-Account File Manager
- * Node.js version for Render hosting
- */
-
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
@@ -28,8 +23,24 @@ app.use(express.urlencoded({ extended: true }));
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 1000 * 1024 * 1024 } // 100MB limit
+  limits: { fileSize: 1000 * 1024 * 1024 } // 1000MB limit
 });
+
+// Helper function to format file size
+function formatSize(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+// Helper function to format time
+function formatTime(seconds) {
+    if (isNaN(seconds)) return '0:00';
+    const minutes = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return minutes + ':' + (secs < 10 ? '0' : '') + secs;
+}
 
 // Create temp directory for file uploads if it doesn't exist
 const tempDir = path.join(__dirname, 'temp');
@@ -38,18 +49,33 @@ if (!fs.existsSync(tempDir)) {
 }
 
 // Parse bucket configuration from environment variable
+// Parse bucket configuration from environment variable
 let bucketConfig;
 try {
-  bucketConfig = JSON.parse(process.env.BUCKET_CONFIG);
+  const configStr = process.env.BUCKET_CONFIG;
+  console.log('BUCKET_CONFIG env variable:', configStr);
+  bucketConfig = JSON.parse(configStr);
+  console.log('Parsed bucket config:', bucketConfig);
 } catch (error) {
   console.error('Error parsing bucket config:', error);
   bucketConfig = {};
 }
 
+// If bucket config is empty, provide a default configuration
+if (!bucketConfig || Object.keys(bucketConfig).length === 0) {
+    console.warn('No bucket configuration found, using empty configuration');
+    bucketConfig = {
+      account1: { bucketName: 'Unconfigured' },
+      account2: { bucketName: 'Unconfigured' }
+    };
+  }
+  
 // Cache for B2 auth tokens
 const authTokenCache = new Map();
 // Cache for file listings
 const fileListCache = new Map();
+// Cache for bucket info
+const bucketInfoCache = new Map();
 const FILE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 // Helper function to get B2 authorization
@@ -90,6 +116,77 @@ async function getAuthToken(account) {
   return authData;
 }
 
+async function getBucketInfo(account) {
+    // Check cache first
+    const cacheKey = `bucket_info_${account}`;
+    if (bucketInfoCache.has(cacheKey)) {
+      const { timestamp, info } = bucketInfoCache.get(cacheKey);
+      if (Date.now() - timestamp < FILE_CACHE_TTL) {
+        return info;
+      }
+    }
+  
+    try {
+      const authData = await getAuthToken(account);
+      
+      // Check if bucket config exists for this account
+      if (!bucketConfig[account] || !bucketConfig[account].bucketId) {
+        console.warn(`No bucket configuration found for account: ${account}`);
+        return {
+          bucketName: `${account} (unconfigured)`,
+          totalFiles: 0,
+          totalSize: 0,
+          bucketQuota: null,
+          usedPercentage: 0
+        };
+      }
+      
+      console.log(`Fetching bucket info for ${account} with bucket ID: ${bucketConfig[account].bucketId}`);
+      
+      const response = await fetch(`${authData.apiUrl}/b2api/v2/b2_get_bucket_info`, {
+        method: 'POST',
+        headers: {
+          'Authorization': authData.authorizationToken,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          bucketId: bucketConfig[account].bucketId
+        })
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`Failed to get bucket info: ${response.status} - ${errorText}`);
+        return {
+          bucketName: `${account} (error: ${response.status})`,
+          totalFiles: 0,
+          totalSize: 0,
+          bucketQuota: null,
+          usedPercentage: 0
+        };
+      }
+      
+      const bucketInfo = await response.json();
+      
+      // Cache the result
+      bucketInfoCache.set(cacheKey, {
+        timestamp: Date.now(),
+        info: bucketInfo
+      });
+      
+      return bucketInfo;
+    } catch (error) {
+      console.error('Error getting bucket info:', error);
+      return {
+        bucketName: `${account} (error: ${error.message})`,
+        totalFiles: 0,
+        totalSize: 0,
+        bucketQuota: null,
+        usedPercentage: 0
+      };
+    }
+  }
+
 // Helper function to list files in a bucket
 async function listFiles(account) {
   // Check cache first
@@ -128,7 +225,7 @@ async function listFiles(account) {
       // Parse the original title from the filename (remove timestamp)
       const parts = filename.split('_');
       const timestamp = parts.pop().split('.')[0];
-      const title = parts.join('_').replace(/_/g, ' ');
+      const title = parts.join('').replace(/_/g, ' ');
       
       return {
         fileName: filename,
@@ -164,6 +261,47 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Get bucket usage info
+app.get('/api/bucket-info/:account', async (req, res) => {
+  try {
+    const account = req.params.account;
+    
+    // Check if the account exists
+    if (!bucketConfig[account]) {
+      return res.status(400).json({ error: 'Invalid account' });
+    }
+    
+    const bucketInfo = await getBucketInfo(account);
+    
+    if (!bucketInfo) {
+      return res.status(500).json({ error: 'Failed to get bucket info' });
+    }
+    
+    // Calculate total size of files
+    const files = await listFiles(account);
+    const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+    
+    // Get bucket quota if available
+    let bucketQuota = null;
+    if (bucketInfo.accountInfo && bucketInfo.accountInfo.allowed && bucketInfo.accountInfo.allowed.capExceeded === false) {
+      bucketQuota = bucketInfo.accountInfo.allowed.capacityBytes;
+    }
+    
+    return res.json({
+      bucketName: bucketInfo.bucketName,
+      bucketType: bucketInfo.bucketType,
+      totalFiles: files.length,
+      totalSize: totalSize,
+      bucketQuota: bucketQuota,
+      usedPercentage: bucketQuota ? (totalSize / bucketQuota) * 100 : null
+    });
+    
+  } catch (error) {
+    console.error('Error getting bucket info:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // Home page
 app.get('/', async (req, res) => {
   try {
@@ -171,12 +309,49 @@ app.get('/', async (req, res) => {
     
     // Get files from all accounts and combine them
     let allFiles = [];
+    let bucketInfos = {};
+    
     for (const account of accountList) {
       try {
         const files = await listFiles(account);
         allFiles = allFiles.concat(files);
+        
+        // Get bucket info
+        const bucketInfo = await getBucketInfo(account);
+        if (bucketInfo) {
+          const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+          let bucketQuota = null;
+          if (bucketInfo.accountInfo && bucketInfo.accountInfo.allowed && bucketInfo.accountInfo.allowed.capExceeded === false) {
+            bucketQuota = bucketInfo.accountInfo.allowed.capacityBytes;
+          }
+          
+          bucketInfos[account] = {
+            bucketName: bucketInfo.bucketName || `${account}`,
+            totalFiles: files.length,
+            totalSize: totalSize,
+            bucketQuota: bucketQuota,
+            usedPercentage: bucketQuota ? (totalSize / bucketQuota) * 100 : null
+          };
+        } else {
+          // Provide default info if bucket info is null
+          bucketInfos[account] = {
+            bucketName: `${account}`,
+            totalFiles: files.length,
+            totalSize: files.reduce((sum, file) => sum + file.size, 0),
+            bucketQuota: null,
+            usedPercentage: null
+          };
+        }
       } catch (error) {
         console.error(`Error listing files for ${account}:`, error);
+        // Provide default info if there's an error
+        bucketInfos[account] = {
+          bucketName: `${account} (error)`,
+          totalFiles: 0,
+          totalSize: 0,
+          bucketQuota: null,
+          usedPercentage: null
+        };
       }
     }
     
@@ -184,13 +359,13 @@ app.get('/', async (req, res) => {
     allFiles.sort((a, b) => b.uploadTimestamp - a.uploadTimestamp);
     
     // Generate the HTML
-    const html = generateHTML(accountList, allFiles);
+    const html = generateHTML(accountList, allFiles, bucketInfos);
     
     res.setHeader('Content-Type', 'text/html');
     res.send(html);
   } catch (error) {
     console.error('Error handling home request:', error);
-    res.status(500).send('Internal Server Error');
+    res.status(500).send('Internal Server Error: ' + error.message);
   }
 });
 
@@ -266,6 +441,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     
     // Clear the file list cache for this account
     fileListCache.delete(`files_${account}`);
+    bucketInfoCache.delete(`bucket_info_${account}`);
     
     // Generate a URL for the uploaded file
     const fileUrl = `/files/${account}/${fullFilename}`;
@@ -281,6 +457,94 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     
   } catch (error) {
     console.error('Upload error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Handle file renaming
+app.post('/rename-file', async (req, res) => {
+  try {
+    const { account, fileId, oldFileName, newTitle } = req.body;
+    
+    // Validate inputs
+    if (!account || !fileId || !oldFileName || !newTitle) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Check if the account exists in our configuration
+    if (!bucketConfig[account]) {
+      return res.status(400).json({ error: 'Invalid account selected' });
+    }
+    
+    // Generate a safe filename (sanitize the title)
+    const safeTitle = newTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    
+    // Extract timestamp and extension from the old filename
+    const oldFileNameParts = oldFileName.split('_');
+    const timestamp = oldFileNameParts.pop().split('.')[0];
+    const extension = oldFileName.split('.').pop();
+    
+    // Create new filename with the same timestamp
+    const newFileName = `${safeTitle}_${timestamp}.${extension}`;
+    const oldB2FileName = `files/${oldFileName}`;
+    const newB2FileName = `files/${newFileName}`;
+    
+    // Get auth token for the account
+    const authData = await getAuthToken(account);
+    
+    // First, copy the file with the new name
+    const copyResponse = await fetch(`${authData.apiUrl}/b2api/v2/b2_copy_file`, {
+      method: 'POST',
+      headers: {
+        'Authorization': authData.authorizationToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        sourceFileId: fileId,
+        fileName: newB2FileName,
+        destinationBucketId: bucketConfig[account].bucketId,
+        metadataDirective: 'COPY'
+      })
+    });
+    
+    if (!copyResponse.ok) {
+      throw new Error('Failed to copy file with new name');
+    }
+    
+    const copyResult = await copyResponse.json();
+    
+    // Then, delete the old file
+    const deleteResponse = await fetch(`${authData.apiUrl}/b2api/v2/b2_delete_file_version`, {
+      method: 'POST',
+      headers: {
+        'Authorization': authData.authorizationToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        fileId: fileId,
+        fileName: oldB2FileName
+      })
+    });
+    
+    if (!deleteResponse.ok) {
+      throw new Error('Failed to delete old file version');
+    }
+    
+    // Clear the file list cache for this account
+    fileListCache.delete(`files_${account}`);
+    
+    // Return success response with the new file info
+    return res.json({
+      success: true,
+      message: 'File renamed successfully',
+      newFileName: newFileName,
+      newFileId: copyResult.fileId,
+      newTitle: newTitle,
+      url: `/files/${account}/${newFileName}`
+    });
+    
+  } catch (error) {
+    console.error('Rename error:', error);
     return res.status(500).json({ error: error.message });
   }
 });
@@ -322,6 +586,7 @@ app.post('/delete-file', async (req, res) => {
     
     // Clear the file list cache for this account
     fileListCache.delete(`files_${account}`);
+    bucketInfoCache.delete(`bucket_info_${account}`);
     
     // Return success response
     return res.json({
@@ -383,10 +648,7 @@ app.get('/files/:account/:filename', async (req, res) => {
 });
 
 // Generate HTML for the home page
-function generateHTML(accountList, allFiles) {
-  // This function is the same as in your original code
-  // I'm assuming you want to keep it as is, so I'm not including the full HTML here
-  // You can copy it from your original code
+function generateHTML(accountList, allFiles, bucketInfos) {
   return `<!DOCTYPE html>
   <html lang="en">
   <head>
@@ -407,6 +669,9 @@ function generateHTML(accountList, allFiles) {
               --border-color: #2c2c2c;
               --secondary-text: #aaaaaa;
               --hover-bg: #252525;
+              --player-bg: #1a1a1a;
+              --player-control: #333333;
+              --player-control-hover: #444444;
           }
           
           * {
@@ -480,6 +745,48 @@ function generateHTML(accountList, allFiles) {
               margin-right: 10px;
               width: 20px;
               text-align: center;
+          }
+          
+          .bucket-info {
+              padding: 15px 20px;
+              border-top: 1px solid var(--border-color);
+              margin-top: 20px;
+          }
+          
+          .bucket-title {
+              font-size: 1rem;
+              font-weight: 600;
+              margin-bottom: 10px;
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+          }
+          
+          .bucket-stats {
+              font-size: 0.85rem;
+              color: var(--secondary-text);
+              margin-bottom: 5px;
+          }
+          
+          .storage-bar {
+              height: 6px;
+              background-color: var(--border-color);
+              border-radius: 3px;
+              overflow: hidden;
+              margin: 10px 0;
+          }
+          
+          .storage-used {
+              height: 100%;
+              background-color: var(--accent-color);
+              width: 0%;
+          }
+          
+          .storage-text {
+              display: flex;
+              justify-content: space-between;
+              font-size: 0.8rem;
+              color: var(--secondary-text);
           }
           
           .upload-btn {
@@ -1080,55 +1387,96 @@ function generateHTML(accountList, allFiles) {
               background-color: #ff7070;
           }
           
-          /* Custom Video Player Styles */
-          .custom-video-player {
+          /* Rename Modal */
+          .rename-modal {
+              display: none;
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: 100%;
+              background-color: rgba(0, 0, 0, 0.7);
+              z-index: 300;
+              overflow: auto;
+              animation: fadeIn 0.3s;
+          }
+          
+          .rename-content {
+              background-color: var(--card-bg);
+              margin: 100px auto;
+              width: 90%;
+              max-width: 400px;
+              border-radius: 8px;
+              box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+              animation: slideIn 0.3s;
+              padding: 20px;
+          }
+          
+          .rename-title {
+              font-size: 1.2rem;
+              font-weight: 600;
+              margin-bottom: 15px;
+              color: var(--accent-color);
+          }
+          
+          /* Enhanced Media Player Styles */
+          .enhanced-media-player {
               position: relative;
               width: 100%;
               max-height: 80vh;
-              background-color: #000;
+              background-color: var(--player-bg);
               border-radius: 8px;
               overflow: hidden;
+              box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
           }
           
-          .video-element {
+          .media-container {
               width: 100%;
-              height: 100%;
+              background-color: #000;
+              position: relative;
+          }
+          
+          .media-element {
+              width: 100%;
+              max-height: 70vh;
               display: block;
           }
           
-          .video-controls {
+          .player-controls {
               position: absolute;
               bottom: 0;
               left: 0;
               right: 0;
               background: linear-gradient(to top, rgba(0, 0, 0, 0.8), transparent);
-              padding: 20px 15px 10px;
+              padding: 30px 20px 15px;
               transition: opacity 0.3s ease;
               opacity: 0;
+              z-index: 10;
           }
           
-          .custom-video-player:hover .video-controls {
+          .enhanced-media-player:hover .player-controls {
               opacity: 1;
           }
           
-          .progress-container {
-              height: 5px;
+          .player-progress {
+              height: 6px;
               background-color: rgba(255, 255, 255, 0.2);
-              border-radius: 2.5px;
+              border-radius: 3px;
               cursor: pointer;
               position: relative;
-              margin-bottom: 10px;
+              margin-bottom: 15px;
               overflow: hidden;
           }
           
-          .buffered-progress {
+          .buffered-bar {
               position: absolute;
               top: 0;
               left: 0;
               height: 100%;
-              background-color: rgba(255, 255, 255, 0.4);
+              background-color: rgba(255, 255, 255, 0.3);
               width: 0%;
-              border-radius: 2.5px;
+              border-radius: 3px;
+              transition: width 0.1s;
           }
           
           .progress-bar {
@@ -1138,17 +1486,17 @@ function generateHTML(accountList, allFiles) {
               height: 100%;
               background-color: var(--accent-color);
               width: 0%;
-              border-radius: 2.5px;
-              transition: width 0.1s linear;
+              border-radius: 3px;
+              transition: width 0.1s;
           }
           
-          .progress-thumb {
+          .progress-handle {
               position: absolute;
-              right: -6px;
+              right: -8px;
               top: 50%;
               transform: translateY(-50%);
-              width: 12px;
-              height: 12px;
+              width: 16px;
+              height: 16px;
               background-color: var(--accent-color);
               border-radius: 50%;
               box-shadow: 0 0 5px rgba(0, 0, 0, 0.5);
@@ -1156,44 +1504,76 @@ function generateHTML(accountList, allFiles) {
               transition: opacity 0.2s;
           }
           
-          .progress-container:hover .progress-thumb {
+          .player-progress:hover .progress-handle {
               opacity: 1;
           }
           
-          .control-buttons {
+          .player-controls-main {
               display: flex;
               align-items: center;
               justify-content: space-between;
+              margin-bottom: 10px;
           }
           
-          .control-btn {
+          .player-controls-left, .player-controls-right {
+              display: flex;
+              align-items: center;
+              gap: 15px;
+          }
+          
+          .player-controls-center {
+              display: flex;
+              align-items: center;
+              gap: 20px;
+          }
+          
+          .player-btn {
               background: none;
               border: none;
               color: white;
               font-size: 16px;
               cursor: pointer;
-              padding: 5px;
-              margin: 0 5px;
               opacity: 0.85;
               transition: opacity 0.2s;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              padding: 8px;
+              border-radius: 50%;
           }
           
-          .control-btn:hover {
+          .player-btn:hover {
               opacity: 1;
+              background-color: rgba(255, 255, 255, 0.1);
           }
           
-          .timestamp {
+          .player-btn.large {
+              font-size: 24px;
+              width: 48px;
+              height: 48px;
+              background-color: rgba(255, 255, 255, 0.1);
+          }
+          
+          .player-btn.large:hover {
+              background-color: rgba(255, 255, 255, 0.2);
+          }
+          
+          .player-btn.active {
+              color: var(--accent-color);
+          }
+          
+          .player-time {
               color: white;
               font-size: 14px;
-              margin: 0 10px;
-              flex-grow: 1;
+              min-width: 100px;
               text-align: center;
           }
           
           .volume-container {
-              position: relative;
               display: flex;
               align-items: center;
+              gap: 10px;
+              position: relative;
           }
           
           .volume-slider {
@@ -1203,18 +1583,21 @@ function generateHTML(accountList, allFiles) {
               border-radius: 2px;
               cursor: pointer;
               overflow: hidden;
-              transition: width 0.2s;
-              margin-left: 5px;
+              transition: width 0.3s;
+              position: relative;
           }
           
           .volume-container:hover .volume-slider {
-              width: 60px;
+              width: 80px;
           }
           
-          .volume-progress {
+          .volume-level {
+              position: absolute;
+              top: 0;
+              left: 0;
               height: 100%;
               background-color: white;
-              width: 75%;
+              width: 70%;
           }
           
           .big-play-button {
@@ -1224,37 +1607,36 @@ function generateHTML(accountList, allFiles) {
               transform: translate(-50%, -50%);
               width: 80px;
               height: 80px;
-              background-color: rgba(0, 0, 0, 0.6);
+              background-color: rgba(124, 77, 255, 0.8);
               border-radius: 50%;
               display: flex;
               align-items: center;
               justify-content: center;
               cursor: pointer;
               transition: all 0.2s;
+              z-index: 5;
           }
           
           .big-play-button i {
               color: white;
-              font-size: 30px;
-              margin-left: 5px; /* Offset for play icon */
+              font-size: 32px;
+              margin-left: 6px; /* Offset for play icon */
           }
           
           .big-play-button:hover {
-              background-color: var(--accent-color);
               transform: translate(-50%, -50%) scale(1.1);
+              background-color: var(--accent-color);
           }
           
-          .loading-spinner {
+          .player-loading {
               position: absolute;
               top: 50%;
               left: 50%;
               transform: translate(-50%, -50%);
-              display: flex;
-              align-items: center;
-              justify-content: center;
+              z-index: 4;
           }
           
-          .spinner {
+          .loading-spinner {
               width: 50px;
               height: 50px;
               border: 4px solid rgba(255, 255, 255, 0.3);
@@ -1263,26 +1645,26 @@ function generateHTML(accountList, allFiles) {
               animation: spin 1s linear infinite;
           }
           
-          @keyframes spin {
-              to { transform: rotate(360deg); }
-          }
-          
           .speed-menu {
               position: absolute;
-              bottom: 60px;
-              right: 50px;
-              background-color: rgba(28, 28, 28, 0.9);
-              border-radius: 4px;
-              padding: 5px 0;
+              bottom: 70px;
+              right: 20px;
+              background-color: rgba(26, 26, 26, 0.95);
+              border-radius: 6px;
+              padding: 8px 0;
               display: none;
-              z-index: 10;
+              z-index: 20;
+              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+              animation: fadeIn 0.2s;
           }
           
           .speed-option {
-              padding: 8px 15px;
+              padding: 8px 20px;
               color: white;
               cursor: pointer;
               transition: background-color 0.2s;
+              font-size: 14px;
+              white-space: nowrap;
           }
           
           .speed-option:hover {
@@ -1291,13 +1673,141 @@ function generateHTML(accountList, allFiles) {
           
           .speed-option[data-active="true"] {
               color: var(--accent-color);
+              font-weight: 500;
           }
           
-          /* Custom Audio Player Styles */
-          .custom-audio-player {
+          .player-settings-menu {
+              position: absolute;
+              bottom: 70px;
+              right: 20px;
+              background-color: rgba(26, 26, 26, 0.95);
+              border-radius: 6px;
+              padding: 10px;
+              display: none;
+              z-index: 20;
+              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+              animation: fadeIn 0.2s;
+              min-width: 200px;
+          }
+          
+          .settings-option {
+              padding: 8px 10px;
+              color: white;
+              cursor: pointer;
+              transition: background-color 0.2s;
+              border-radius: 4px;
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              margin-bottom: 5px;
+          }
+          
+          .settings-option:hover {
+              background-color: rgba(255, 255, 255, 0.1);
+          }
+          
+          .settings-option i {
+              margin-right: 10px;
+              width: 16px;
+              text-align: center;
+          }
+          
+          .settings-toggle {
+              position: relative;
+              display: inline-block;
+              width: 36px;
+              height: 20px;
+          }
+          
+          .settings-toggle input {
+              opacity: 0;
+              width: 0;
+              height: 0;
+          }
+          
+          .toggle-slider {
+              position: absolute;
+              cursor: pointer;
+              top: 0;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              background-color: #444;
+              transition: .4s;
+              border-radius: 20px;
+          }
+          
+          .toggle-slider:before {
+              position: absolute;
+              content: "";
+              height: 16px;
+              width: 16px;
+              left: 2px;
+              bottom: 2px;
+              background-color: white;
+              transition: .4s;
+              border-radius: 50%;
+          }
+          
+          input:checked + .toggle-slider {
+              background-color: var(--accent-color);
+          }
+          
+          input:checked + .toggle-slider:before {
+              transform: translateX(16px);
+          }
+          
+          .player-title-bar {
+              position: absolute;
+              top: 0;
+              left: 0;
+              right: 0;
+              background: linear-gradient(to bottom, rgba(0, 0, 0, 0.8), transparent);
+              padding: 15px 20px;
+              transition: opacity 0.3s ease;
+              opacity: 0;
+              z-index: 5;
+          }
+          
+          .enhanced-media-player:hover .player-title-bar {
+              opacity: 1;
+          }
+          
+          .player-title {
+              color: white;
+              font-size: 16px;
+              font-weight: 500;
+          }
+          
+          /* Fullscreen styles */
+          .enhanced-media-player.fullscreen {
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100vw;
+              height: 100vh;
+              max-height: 100vh;
+              z-index: 1000;
+              border-radius: 0;
+          }
+          
+          .enhanced-media-player.fullscreen .media-container {
+              height: 100vh;
+          }
+          
+          .enhanced-media-player.fullscreen .media-element {
+              max-height: 100vh;
+              height: 100vh;
+              object-fit: contain;
+          }
+          
+          /* Enhanced Audio Player Styles */
+          .enhanced-audio-player {
               width: 100%;
-              background-color: var(--card-bg);
+              background-color: var(--player-bg);
               border-radius: 8px;
+              overflow: hidden;
+              box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
               padding: 20px;
               margin: 20px 0;
           }
@@ -1312,9 +1822,9 @@ function generateHTML(accountList, allFiles) {
           }
           
           .audio-bar {
-              width: 8px;
+              width: 4px;
               background: linear-gradient(to top, var(--accent-color), #9e7bff);
-              border-radius: 4px;
+              border-radius: 2px;
               transition: height 0.2s ease;
           }
           
@@ -1322,41 +1832,139 @@ function generateHTML(accountList, allFiles) {
               display: flex;
               align-items: center;
               gap: 15px;
+              flex-wrap: wrap;
           }
           
-          .audio-control-btn {
+          .audio-controls-main {
+              display: flex;
+              align-items: center;
+              gap: 15px;
+              flex: 1;
+          }
+          
+          .audio-btn {
               background: none;
               border: none;
               color: var(--text-color);
               font-size: 18px;
               cursor: pointer;
-              padding: 5px;
+              padding: 8px;
+              border-radius: 50%;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              transition: all 0.2s;
+          }
+          
+          .audio-btn:hover {
+              background-color: rgba(255, 255, 255, 0.1);
+          }
+          
+          .audio-btn.large {
+              font-size: 24px;
+              width: 48px;
+              height: 48px;
+              background-color: rgba(255, 255, 255, 0.1);
+          }
+          
+          .audio-btn.large:hover {
+              background-color: rgba(255, 255, 255, 0.2);
+          }
+          
+          .audio-btn.active {
+              color: var(--accent-color);
           }
           
           .audio-progress-container {
               flex-grow: 1;
-              height: 5px;
+              height: 6px;
               background-color: rgba(255, 255, 255, 0.1);
-              border-radius: 2.5px;
+              border-radius: 3px;
               cursor: pointer;
               position: relative;
               overflow: hidden;
+              margin: 0 15px;
           }
           
-          .audio-progress {
+          .audio-buffered-bar {
+              position: absolute;
+              top: 0;
+              left: 0;
+              height: 100%;
+              background-color: rgba(255, 255, 255, 0.2);
+              width: 0%;
+          }
+          
+          .audio-progress-bar {
               position: absolute;
               top: 0;
               left: 0;
               height: 100%;
               background-color: var(--accent-color);
               width: 0%;
-              border-radius: 2.5px;
+          }
+          
+          .audio-progress-handle {
+              position: absolute;
+              right: -8px;
+              top: 50%;
+              transform: translateY(-50%);
+              width: 16px;
+              height: 16px;
+              background-color: var(--accent-color);
+              border-radius: 50%;
+              box-shadow: 0 0 5px rgba(0, 0, 0, 0.5);
+              opacity: 0;
+              transition: opacity 0.2s;
+          }
+          
+          .audio-progress-container:hover .audio-progress-handle {
+              opacity: 1;
           }
           
           .audio-time {
               color: var(--text-color);
               font-size: 14px;
               min-width: 90px;
+              text-align: center;
+          }
+          
+          .audio-volume-container {
+              display: flex;
+              align-items: center;
+              gap: 10px;
+              position: relative;
+          }
+          
+          .audio-volume-slider {
+              width: 0;
+              height: 4px;
+              background-color: rgba(255, 255, 255, 0.2);
+              border-radius: 2px;
+              cursor: pointer;
+              overflow: hidden;
+              transition: width 0.3s;
+              position: relative;
+          }
+          
+          .audio-volume-container:hover .audio-volume-slider {
+              width: 80px;
+          }
+          
+          .audio-volume-level {
+              position: absolute;
+              top: 0;
+              left: 0;
+              height: 100%;
+              background-color: var(--accent-color);
+              width: 70%;
+          }
+          
+          .audio-title {
+              font-size: 18px;
+              font-weight: 500;
+              margin-bottom: 15px;
+              color: var(--text-color);
               text-align: center;
           }
           
@@ -1419,7 +2027,7 @@ function generateHTML(accountList, allFiles) {
                   align-items: center;
               }
               
-              .sidebar-header, .upload-btn {
+              .sidebar-header, .upload-btn, .bucket-info {
                   display: none;
               }
               
@@ -1486,18 +2094,25 @@ function generateHTML(accountList, allFiles) {
                   margin: 20px auto;
               }
               
-              .control-buttons {
+              .player-controls-main {
                   flex-wrap: wrap;
               }
               
-              .timestamp {
-                  order: 1;
+              .player-controls-center {
+                  order: -1;
+                  width: 100%;
+                  justify-content: center;
+                  margin-bottom: 10px;
+              }
+              
+              .player-time {
+                  order: 2;
                   width: 100%;
                   margin: 10px 0 0;
               }
               
               .volume-container:hover .volume-slider {
-                  width: 40px;
+                  width: 60px;
               }
               
               .big-play-button {
@@ -1514,7 +2129,16 @@ function generateHTML(accountList, allFiles) {
               }
               
               .audio-bar {
-                  width: 6px;
+                  width: 3px;
+              }
+              
+              .audio-controls {
+                  flex-direction: column;
+                  gap: 10px;
+              }
+              
+              .audio-controls-main {
+                  width: 100%;
               }
               
               .audio-time {
@@ -1556,6 +2180,10 @@ function generateHTML(accountList, allFiles) {
           @keyframes zoomIn {
               from { transform: scale(0.9); opacity: 0; }
               to { transform: scale(1); opacity: 1; }
+          }
+          
+          @keyframes spin {
+              to { transform: rotate(360deg); }
           }
           
           /* Utility Classes */
@@ -1632,16 +2260,45 @@ function generateHTML(accountList, allFiles) {
                       </a>
                   </li>
               </ul>
+              
+              <!-- Bucket Info -->
+              ${Object.keys(bucketInfos).map(account => {
+                  const info = bucketInfos[account];
+                  const usedSize = formatSize(info.totalSize);
+                  const totalSize = info.bucketQuota ? formatSize(info.bucketQuota) : 'Unlimited';
+                  const usedPercentage = info.usedPercentage ? Math.min(info.usedPercentage, 100).toFixed(1) : 0;
+                  
+                  return `
+                  <div class="bucket-info">
+                      <div class="bucket-title">
+                          <span>${info.bucketName}</span>
+                          <span>${account}</span>
+                      </div>
+                      <div class="bucket-stats">
+                          <span>${info.totalFiles} files</span>
+                      </div>
+                      <div class="storage-bar">
+                          <div class="storage-used" style="width: ${usedPercentage}%"></div>
+                      </div>
+                      <div class="storage-text">
+                          <span>${usedSize} used</span>
+                          <span>${totalSize} total</span>
+                      </div>
+                  </div>
+                  `;
+              }).join('')}
           </aside>
           
           <!-- Main Content -->
           <main class="main-content">
               <div class="page-header">
                   <h1 class="page-title">All Files</h1>
+                  
                   <div class="search-container">
                       <i class="fas fa-search search-icon"></i>
                       <input type="text" class="search-input" placeholder="Search files..." id="searchInput">
                   </div>
+                  
                   <div class="filter-container">
                       <select class="filter-select" id="typeFilter">
                           <option value="all">All Types</option>
@@ -1732,7 +2389,14 @@ function generateHTML(accountList, allFiles) {
                           <label for="accountSelect" class="form-label">Select Account/Bucket:</label>
                           <select id="accountSelect" name="account" class="form-select" required>
                               <option value="">-- Select Account --</option>
-                              ${accountList.map(account => `<option value="${account}">${account}</option>`).join('')}
+                              ${accountList.map(account => {
+                                  const info = bucketInfos[account];
+                                  const usedSize = formatSize(info.totalSize);
+                                  const totalSize = info.bucketQuota ? formatSize(info.bucketQuota) : 'Unlimited';
+                                  const usedPercentage = info.usedPercentage ? Math.min(info.usedPercentage, 100).toFixed(1) : 0;
+                                  
+                                  return `<option value="${account}">${account} (${usedSize} / ${totalSize}, ${usedPercentage}% used)</option>`;
+                              }).join('')}
                           </select>
                       </div>
                       
@@ -1782,6 +2446,9 @@ function generateHTML(accountList, allFiles) {
                   <button class="file-viewer-btn" id="shareFileBtn">
                       <i class="fas fa-share-alt"></i> Share
                   </button>
+                  <button class="file-viewer-btn" id="renameFileBtn">
+                      <i class="fas fa-edit"></i> Rename
+                  </button>
                   <button class="file-viewer-btn delete" id="deleteFileBtn">
                       <i class="fas fa-trash-alt"></i> Delete
                   </button>
@@ -1797,6 +2464,21 @@ function generateHTML(accountList, allFiles) {
               <div class="confirm-buttons">
                   <button class="confirm-btn cancel" id="cancelDeleteBtn">Cancel</button>
                   <button class="confirm-btn delete" id="confirmDeleteBtn">Delete</button>
+              </div>
+          </div>
+      </div>
+      
+      <!-- Rename Modal -->
+      <div class="rename-modal" id="renameModal">
+          <div class="rename-content">
+              <h3 class="rename-title">Rename File</h3>
+              <div class="form-group">
+                  <label for="newFileName" class="form-label">New File Name:</label>
+                  <input type="text" id="newFileName" class="form-control" placeholder="Enter new file name">
+              </div>
+              <div class="confirm-buttons">
+                  <button class="confirm-btn cancel" id="cancelRenameBtn">Cancel</button>
+                  <button class="confirm-btn" id="confirmRenameBtn" style="background-color: var(--accent-color); color: white; border: none;">Rename</button>
               </div>
           </div>
       </div>
@@ -1830,14 +2512,28 @@ function generateHTML(accountList, allFiles) {
           const closeFileViewerBtn = document.getElementById('closeFileViewerBtn');
           const downloadFileBtn = document.getElementById('downloadFileBtn');
           const shareFileBtn = document.getElementById('shareFileBtn');
+          const renameFileBtn = document.getElementById('renameFileBtn');
           const deleteFileBtn = document.getElementById('deleteFileBtn');
           const confirmDeleteModal = document.getElementById('confirmDeleteModal');
           const cancelDeleteBtn = document.getElementById('cancelDeleteBtn');
           const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
+          const renameModal = document.getElementById('renameModal');
+          const newFileName = document.getElementById('newFileName');
+          const cancelRenameBtn = document.getElementById('cancelRenameBtn');
+          const confirmRenameBtn = document.getElementById('confirmRenameBtn');
           const toastContainer = document.getElementById('toastContainer');
           
           // Current file being viewed
           let currentFile = null;
+          
+          // Player settings
+          let playerSettings = {
+              autoplay: false,
+              muted: false,
+              volume: 0.7,
+              playbackRate: 1.0,
+              loop: false
+          };
           
           // Open Upload Modal
           openUploadBtn.addEventListener('click', () => {
@@ -1856,7 +2552,7 @@ function generateHTML(accountList, allFiles) {
               document.body.style.overflow = 'auto';
           });
           
-          // Close modal when clicking outside
+          // Close modals when clicking outside
           window.addEventListener('click', (e) => {
               if (e.target === uploadModal) {
                   uploadModal.style.display = 'none';
@@ -1868,9 +2564,18 @@ function generateHTML(accountList, allFiles) {
                   // Stop video/audio if playing
                   const mediaElements = fileViewerBody.querySelectorAll('video, audio');
                   mediaElements.forEach(media => media.pause());
+                  
+                  // Exit fullscreen if active
+                  const player = document.querySelector('.enhanced-media-player');
+                  if (player && player.classList.contains('fullscreen')) {
+                      player.classList.remove('fullscreen');
+                  }
               }
               if (e.target === confirmDeleteModal) {
                   confirmDeleteModal.style.display = 'none';
+              }
+              if (e.target === renameModal) {
+                  renameModal.style.display = 'none';
               }
           });
           
@@ -1935,7 +2640,7 @@ function generateHTML(accountList, allFiles) {
                   return;
               }
               
-              // Check file size (limit to 100MB for simplicity)
+              // Check file size (limit to 1000MB)
               if (file.size > 1000 * 1024 * 1024) {
                   showError('File size exceeds 1000MB limit. Please choose a smaller file.');
                   return;
@@ -2039,18 +2744,18 @@ function generateHTML(accountList, allFiles) {
           
           function showToast(type, message) {
             const toast = document.createElement('div');
-            toast.className = \`toast \${type}\`;
+            toast.className = 'toast ' + type;
             
             const icon = type === 'success' 
                 ? '<i class="fas fa-check-circle"></i>' 
                 : '<i class="fas fa-exclamation-circle"></i>';
                 
-            toast.innerHTML = \`\${icon} <span>\${message}</span>\`;
+            toast.innerHTML = icon + ' <span>' + message + '</span>';
             
             toastContainer.appendChild(toast);
             
             // Remove toast after 3 seconds
-            setTimeout(() => {
+            setTimeout(function() {
                 toast.remove();
             }, 3000);
         }
@@ -2154,6 +2859,819 @@ function generateHTML(accountList, allFiles) {
               }
           });
           
+          // Enhanced Media Player
+          function createEnhancedVideoPlayer(videoUrl, title) {
+              const playerContainer = document.createElement('div');
+              playerContainer.className = 'enhanced-media-player';
+              
+              const mediaContainer = document.createElement('div');
+              mediaContainer.className = 'media-container';
+              
+              // Title bar
+              const titleBar = document.createElement('div');
+              titleBar.className = 'player-title-bar';
+              titleBar.innerHTML = '<div class="player-title">' + title + '</div>';
+              
+              // Video element
+              const video = document.createElement('video');
+              video.className = 'media-element';
+              video.src = videoUrl;
+              video.preload = 'metadata';
+              video.playsInline = true;
+              
+              // Big play button
+              const bigPlayBtn = document.createElement('div');
+              bigPlayBtn.className = 'big-play-button';
+              bigPlayBtn.innerHTML = '<i class="fas fa-play"></i>';
+              
+              // Loading spinner
+              const loadingSpinner = document.createElement('div');
+              loadingSpinner.className = 'player-loading';
+              loadingSpinner.innerHTML = '<div class="loading-spinner"></div>';
+              loadingSpinner.style.display = 'none';
+              
+              // Controls
+              const controls = document.createElement('div');
+              controls.className = 'player-controls';
+              
+              // Progress bar
+              const progressContainer = document.createElement('div');
+              progressContainer.className = 'player-progress';
+              
+              const bufferedBar = document.createElement('div');
+              bufferedBar.className = 'buffered-bar';
+              
+              const progressBar = document.createElement('div');
+              progressBar.className = 'progress-bar';
+              
+              const progressHandle = document.createElement('div');
+              progressHandle.className = 'progress-handle';
+              
+              progressBar.appendChild(progressHandle);
+              progressContainer.appendChild(bufferedBar);
+              progressContainer.appendChild(progressBar);
+              
+              // Main controls
+              const controlsMain = document.createElement('div');
+              controlsMain.className = 'player-controls-main';
+              
+              // Left controls
+              const controlsLeft = document.createElement('div');
+              controlsLeft.className = 'player-controls-left';
+              
+              const playBtn = document.createElement('button');
+              playBtn.className = 'player-btn large';
+              playBtn.innerHTML = '<i class="fas fa-play"></i>';
+              
+              const volumeContainer = document.createElement('div');
+              volumeContainer.className = 'volume-container';
+              
+              const volumeBtn = document.createElement('button');
+              volumeBtn.className = 'player-btn';
+              volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+              
+              const volumeSlider = document.createElement('div');
+              volumeSlider.className = 'volume-slider';
+              
+              const volumeLevel = document.createElement('div');
+              volumeLevel.className = 'volume-level';
+              volumeLevel.style.width = (playerSettings.volume * 100) + '%';
+              
+              volumeSlider.appendChild(volumeLevel);
+              volumeContainer.appendChild(volumeBtn);
+              volumeContainer.appendChild(volumeSlider);
+              
+              controlsLeft.appendChild(playBtn);
+              controlsLeft.appendChild(volumeContainer);
+              
+              // Center controls
+              const controlsCenter = document.createElement('div');
+              controlsCenter.className = 'player-controls-center';
+              
+              const prevBtn = document.createElement('button');
+              prevBtn.className = 'player-btn';
+              prevBtn.innerHTML = '<i class="fas fa-step-backward"></i>';
+              
+              const nextBtn = document.createElement('button');
+              nextBtn.className = 'player-btn';
+              nextBtn.innerHTML = '<i class="fas fa-step-forward"></i>';
+              
+              controlsCenter.appendChild(prevBtn);
+              controlsCenter.appendChild(nextBtn);
+              
+              // Right controls
+              const controlsRight = document.createElement('div');
+              controlsRight.className = 'player-controls-right';
+              
+              const timeDisplay = document.createElement('div');
+              timeDisplay.className = 'player-time';
+              timeDisplay.textContent = '0:00 / 0:00';
+              
+              const speedBtn = document.createElement('button');
+              speedBtn.className = 'player-btn';
+              speedBtn.innerHTML = '<i class="fas fa-tachometer-alt"></i>';
+              
+              const settingsBtn = document.createElement('button');
+              settingsBtn.className = 'player-btn';
+              settingsBtn.innerHTML = '<i class="fas fa-cog"></i>';
+              
+              const fullscreenBtn = document.createElement('button');
+              fullscreenBtn.className = 'player-btn';
+              fullscreenBtn.innerHTML = '<i class="fas fa-expand"></i>';
+              
+              controlsRight.appendChild(timeDisplay);
+              controlsRight.appendChild(speedBtn);
+              controlsRight.appendChild(settingsBtn);
+              controlsRight.appendChild(fullscreenBtn);
+              
+              // Assemble controls
+              controlsMain.appendChild(controlsLeft);
+              controlsMain.appendChild(controlsCenter);
+              controlsMain.appendChild(controlsRight);
+              
+              controls.appendChild(progressContainer);
+              controls.appendChild(controlsMain);
+              
+              // Speed menu
+            const speedMenu = document.createElement('div');
+            speedMenu.className = 'speed-menu';
+            speedMenu.innerHTML = 
+                '<div class="speed-option" data-speed="0.5">0.5x</div>' +
+                '<div class="speed-option" data-speed="0.75">0.75x</div>' +
+                '<div class="speed-option" data-speed="1.0" data-active="true">Normal (1x)</div>' +
+                '<div class="speed-option" data-speed="1.25">1.25x</div>' +
+                '<div class="speed-option" data-speed="1.5">1.5x</div>' +
+                '<div class="speed-option" data-speed="2.0">2x</div>'
+                ;
+              
+              // Settings menu
+            const settingsMenu = document.createElement('div');
+            settingsMenu.className = 'player-settings-menu';
+            settingsMenu.innerHTML = 
+                '<div class="settings-option autoplay-option">' +
+                '    <div><i class="fas fa-play-circle"></i> Autoplay</div>' +
+                '    <label class="settings-toggle">' +
+                '        <input type="checkbox" class="autoplay-toggle" ' + (playerSettings.autoplay ? 'checked' : '') + '>' +
+                '        <span class="toggle-slider"></span>' +
+                '    </label>' +
+                '</div>' +
+                '<div class="settings-option loop-option">' +
+                '    <div><i class="fas fa-redo"></i> Loop</div>' +
+                '    <label class="settings-toggle">' +
+                '        <input type="checkbox" class="loop-toggle" ' + (playerSettings.loop ? 'checked' : '') + '>' +
+                '        <span class="toggle-slider"></span>' +
+                '    </label>' +
+                '</div>';
+              
+              // Assemble player
+              mediaContainer.appendChild(video);
+              mediaContainer.appendChild(titleBar);
+              mediaContainer.appendChild(bigPlayBtn);
+              mediaContainer.appendChild(loadingSpinner);
+              mediaContainer.appendChild(controls);
+              
+              playerContainer.appendChild(mediaContainer);
+              playerContainer.appendChild(speedMenu);
+              playerContainer.appendChild(settingsMenu);
+              
+              // Event listeners
+              video.addEventListener('loadstart', () => {
+                  loadingSpinner.style.display = 'block';
+              });
+              
+              video.addEventListener('canplay', () => {
+                  loadingSpinner.style.display = 'none';
+                  
+                  // Apply saved settings
+                  video.volume = playerSettings.volume;
+                  video.playbackRate = playerSettings.playbackRate;
+                  video.loop = playerSettings.loop;
+                  
+                  // Autoplay if enabled
+                  if (playerSettings.autoplay) {
+                      video.play().catch(e => {
+                          console.log('Autoplay prevented:', e);
+                          // Show big play button if autoplay fails
+                          bigPlayBtn.style.display = 'flex';
+                      });
+                  }
+              });
+              
+              video.addEventListener('timeupdate', function() {
+                // Update progress bar
+                const percent = (video.currentTime / video.duration) * 100;
+                progressBar.style.width = percent + '%';
+                
+                // Update time display
+                const currentTime = formatTime(video.currentTime);
+                const duration = formatTime(video.duration);
+                timeDisplay.textContent = currentTime + ' / ' + duration;
+            });
+
+              video.addEventListener('progress', function() {
+                    // Update buffered progress
+                    if (video.buffered.length > 0) {
+                        const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+                        const duration = video.duration;
+                        const percent = (bufferedEnd / duration) * 100;
+                        bufferedBar.style.width = percent + '%';
+                    }
+                });
+              
+              video.addEventListener('play', () => {
+                  playBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                  bigPlayBtn.style.display = 'none';
+              });
+              
+              video.addEventListener('pause', () => {
+                  playBtn.innerHTML = '<i class="fas fa-play"></i>';
+                  bigPlayBtn.style.display = 'flex';
+              });
+              
+              video.addEventListener('ended', () => {
+                  playBtn.innerHTML = '<i class="fas fa-play"></i>';
+                  bigPlayBtn.style.display = 'flex';
+                  
+                  // If not looping, try to play next video
+                  if (!playerSettings.loop) {
+                      // Find next video file
+                      const fileCards = Array.from(document.querySelectorAll('.file-card'));
+                      const videoFiles = fileCards.filter(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          return fileData.contentType.startsWith('video/');
+                      });
+                      
+                      if (videoFiles.length > 1) {
+                          const currentIndex = videoFiles.findIndex(card => {
+                              const fileData = JSON.parse(card.getAttribute('data-file'));
+                              return fileData.url === videoUrl;
+                          });
+                          
+                          if (currentIndex !== -1) {
+                              const nextIndex = (currentIndex + 1) % videoFiles.length;
+                              const nextFileData = JSON.parse(videoFiles[nextIndex].getAttribute('data-file'));
+                              
+                              // Open next video
+                              if (playerSettings.autoplay) {
+                                  openFileViewer(nextFileData);
+                              }
+                          }
+                      }
+                  }
+              });
+              
+              // Play/pause on video click
+              video.addEventListener('click', () => {
+                  if (video.paused) {
+                      video.play();
+                  } else {
+                      video.pause();
+                  }
+              });
+              
+              // Big play button click
+              bigPlayBtn.addEventListener('click', () => {
+                  video.play();
+              });
+              
+              // Play/pause button click
+              playBtn.addEventListener('click', () => {
+                  if (video.paused) {
+                      video.play();
+                  } else {
+                      video.pause();
+                  }
+              });
+              
+              // Volume button click
+              volumeBtn.addEventListener('click', () => {
+                  if (video.muted) {
+                      video.muted = false;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+                      volumeLevel.style.width = (playerSettings.volume * 100) + '%';
+                  } else {
+                      video.muted = true;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                      volumeLevel.style.width = '0%';
+                  }
+                  
+                  playerSettings.muted = video.muted;
+                  savePlayerSettings();
+              });
+              
+              // Volume slider
+              volumeSlider.addEventListener('click', (e) => {
+                  const rect = volumeSlider.getBoundingClientRect();
+                  const pos = (e.clientX - rect.left) / rect.width;
+                  const volume = Math.max(0, Math.min(1, pos));
+                  
+                  video.volume = volume;
+                  volumeLevel.style.width = (volume * 100) + '%';
+                  
+                  if (volume === 0) {
+                      video.muted = true;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                  } else {
+                      video.muted = false;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+                  }
+                  
+                  playerSettings.volume = volume;
+                  playerSettings.muted = video.muted;
+                  savePlayerSettings();
+              });
+              
+              // Progress bar click
+              progressContainer.addEventListener('click', (e) => {
+                  const rect = progressContainer.getBoundingClientRect();
+                  const pos = (e.clientX - rect.left) / rect.width;
+                  video.currentTime = pos * video.duration;
+              });
+              
+              // Speed button click
+              speedBtn.addEventListener('click', () => {
+                  settingsMenu.style.display = 'none';
+                  speedMenu.style.display = speedMenu.style.display === 'block' ? 'none' : 'block';
+              });
+              
+              // Settings button click
+              settingsBtn.addEventListener('click', () => {
+                  speedMenu.style.display = 'none';
+                  settingsMenu.style.display = settingsMenu.style.display === 'block' ? 'none' : 'block';
+              });
+              
+              // Speed option click
+              speedMenu.addEventListener('click', (e) => {
+                  const option = e.target.closest('.speed-option');
+                  if (option) {
+                      const speed = parseFloat(option.getAttribute('data-speed'));
+                      video.playbackRate = speed;
+                      
+                      // Update active state
+                      speedMenu.querySelectorAll('.speed-option').forEach(opt => {
+                          opt.setAttribute('data-active', 'false');
+                      });
+                      option.setAttribute('data-active', 'true');
+                      
+                      // Save setting
+                      playerSettings.playbackRate = speed;
+                      savePlayerSettings();
+                      
+                      // Hide menu
+                      speedMenu.style.display = 'none';
+                  }
+              });
+              
+              // Settings options
+              settingsMenu.querySelector('.autoplay-toggle').addEventListener('change', (e) => {
+                  playerSettings.autoplay = e.target.checked;
+                  savePlayerSettings();
+              });
+              
+              settingsMenu.querySelector('.loop-toggle').addEventListener('change', (e) => {
+                  playerSettings.loop = e.target.checked;
+                  video.loop = e.target.checked;
+                  savePlayerSettings();
+              });
+              
+              // Fullscreen button
+              fullscreenBtn.addEventListener('click', () => {
+                  if (playerContainer.classList.contains('fullscreen')) {
+                      // Exit fullscreen
+                      playerContainer.classList.remove('fullscreen');
+                      fullscreenBtn.innerHTML = '<i class="fas fa-expand"></i>';
+                      document.body.style.overflow = 'auto';
+                  } else {
+                      // Enter fullscreen
+                      playerContainer.classList.add('fullscreen');
+                      fullscreenBtn.innerHTML = '<i class="fas fa-compress"></i>';
+                      document.body.style.overflow = 'hidden';
+                  }
+              });
+              
+              // Previous/Next buttons
+              prevBtn.addEventListener('click', () => {
+                  // Find previous video file
+                  const fileCards = Array.from(document.querySelectorAll('.file-card'));
+                  const videoFiles = fileCards.filter(card => {
+                      const fileData = JSON.parse(card.getAttribute('data-file'));
+                      return fileData.contentType.startsWith('video/');
+                  });
+                  
+                  if (videoFiles.length > 1) {
+                      const currentIndex = videoFiles.findIndex(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          return fileData.url === videoUrl;
+                      });
+                      
+                      if (currentIndex !== -1) {
+                          const prevIndex = (currentIndex - 1 + videoFiles.length) % videoFiles.length;
+                          const prevFileData = JSON.parse(videoFiles[prevIndex].getAttribute('data-file'));
+                          
+                          // Open previous video
+                          openFileViewer(prevFileData);
+                      }
+                  }
+              });
+              
+              nextBtn.addEventListener('click', () => {
+                  // Find next video file
+                  const fileCards = Array.from(document.querySelectorAll('.file-card'));
+                  const videoFiles = fileCards.filter(card => {
+                      const fileData = JSON.parse(card.getAttribute('data-file'));
+                      return fileData.contentType.startsWith('video/');
+                  });
+                  
+                  if (videoFiles.length > 1) {
+                      const currentIndex = videoFiles.findIndex(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          return fileData.url === videoUrl;
+                      });
+                      
+                      if (currentIndex !== -1) {
+                          const nextIndex = (currentIndex + 1) % videoFiles.length;
+                          const nextFileData = JSON.parse(videoFiles[nextIndex].getAttribute('data-file'));
+                          
+                          // Open next video
+                          openFileViewer(nextFileData);
+                      }
+                  }
+              });
+              
+              // Hide menus when clicking elsewhere
+              document.addEventListener('click', (e) => {
+                  if (!speedBtn.contains(e.target) && !speedMenu.contains(e.target)) {
+                      speedMenu.style.display = 'none';
+                  }
+                  if (!settingsBtn.contains(e.target) && !settingsMenu.contains(e.target)) {
+                      settingsMenu.style.display = 'none';
+                  }
+              });
+              
+              // Handle ESC key to exit fullscreen
+              document.addEventListener('keydown', (e) => {
+                  if (e.key === 'Escape' && playerContainer.classList.contains('fullscreen')) {
+                      playerContainer.classList.remove('fullscreen');
+                      fullscreenBtn.innerHTML = '<i class="fas fa-expand"></i>';
+                      document.body.style.overflow = 'auto';
+                  }
+              });
+              
+              return playerContainer;
+          }
+          
+          // Enhanced Audio Player
+          function createEnhancedAudioPlayer(audioUrl, title) {
+              const playerContainer = document.createElement('div');
+              playerContainer.className = 'enhanced-audio-player';
+              
+              // Title
+              const audioTitle = document.createElement('div');
+              audioTitle.className = 'audio-title';
+              audioTitle.textContent = title;
+              
+              // Audio visualization
+              const visualization = document.createElement('div');
+              visualization.className = 'audio-visualization';
+              
+              // Create 40 bars for visualization
+              for (let i = 0; i < 40; i++) {
+                  const bar = document.createElement('div');
+                  bar.className = 'audio-bar';
+                  bar.style.height = Math.floor(Math.random() * 70 + 10) + 'px';
+                  visualization.appendChild(bar);
+              }
+              
+              // Audio element
+              const audio = document.createElement('audio');
+              audio.src = audioUrl;
+              audio.preload = 'metadata';
+              
+              // Controls
+              const controls = document.createElement('div');
+              controls.className = 'audio-controls';
+              
+              // Main controls
+              const controlsMain = document.createElement('div');
+              controlsMain.className = 'audio-controls-main';
+              
+              const playBtn = document.createElement('button');
+              playBtn.className = 'audio-btn large';
+              playBtn.innerHTML = '<i class="fas fa-play"></i>';
+              
+              const prevBtn = document.createElement('button');
+              prevBtn.className = 'audio-btn';
+              prevBtn.innerHTML = '<i class="fas fa-step-backward"></i>';
+              
+              const nextBtn = document.createElement('button');
+              nextBtn.className = 'audio-btn';
+              nextBtn.innerHTML = '<i class="fas fa-step-forward"></i>';
+              
+              const progressContainer = document.createElement('div');
+              progressContainer.className = 'audio-progress-container';
+              
+              const bufferedBar = document.createElement('div');
+              bufferedBar.className = 'audio-buffered-bar';
+              
+              const progressBar = document.createElement('div');
+              progressBar.className = 'audio-progress-bar';
+              
+              const progressHandle = document.createElement('div');
+              progressHandle.className = 'audio-progress-handle';
+              
+              progressBar.appendChild(progressHandle);
+              progressContainer.appendChild(bufferedBar);
+              progressContainer.appendChild(progressBar);
+              
+              const timeDisplay = document.createElement('div');
+              timeDisplay.className = 'audio-time';
+              timeDisplay.textContent = '0:00 / 0:00';
+              
+              const volumeContainer = document.createElement('div');
+              volumeContainer.className = 'audio-volume-container';
+              
+              const volumeBtn = document.createElement('button');
+              volumeBtn.className = 'audio-btn';
+              volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+              
+              const volumeSlider = document.createElement('div');
+              volumeSlider.className = 'audio-volume-slider';
+              
+              const volumeLevel = document.createElement('div');
+              volumeLevel.className = 'audio-volume-level';
+              volumeLevel.style.width = (playerSettings.volume * 100) + '%';
+              
+              volumeSlider.appendChild(volumeLevel);
+              volumeContainer.appendChild(volumeBtn);
+              volumeContainer.appendChild(volumeSlider);
+              
+              const loopBtn = document.createElement('button');
+              loopBtn.className = 'audio-btn' + (playerSettings.loop ? ' active' : '');
+              loopBtn.innerHTML = '<i class="fas fa-redo"></i>';
+              
+              // Assemble controls
+              controlsMain.appendChild(prevBtn);
+              controlsMain.appendChild(playBtn);
+              controlsMain.appendChild(nextBtn);
+              controlsMain.appendChild(progressContainer);
+              controlsMain.appendChild(timeDisplay);
+              
+              controls.appendChild(controlsMain);
+              controls.appendChild(volumeContainer);
+              controls.appendChild(loopBtn);
+              
+              // Assemble player
+              playerContainer.appendChild(audioTitle);
+              playerContainer.appendChild(visualization);
+              playerContainer.appendChild(controls);
+              playerContainer.appendChild(audio);
+              
+              // Event listeners
+              audio.addEventListener('canplay', () => {
+                  // Apply saved settings
+                  audio.volume = playerSettings.volume;
+                  audio.playbackRate = playerSettings.playbackRate;
+                  audio.loop = playerSettings.loop;
+                  
+                  // Autoplay if enabled
+                  if (playerSettings.autoplay) {
+                      audio.play().catch(e => {
+                          console.log('Autoplay prevented:', e);
+                      });
+                  }
+              });
+              
+              audio.addEventListener('timeupdate', function() {
+                // Update progress bar
+                const percent = (audio.currentTime / audio.duration) * 100;
+                progressBar.style.width = percent + '%';
+                
+                // Update time display
+                const currentTime = formatTime(audio.currentTime);
+                const duration = formatTime(audio.duration);
+                timeDisplay.textContent = currentTime + ' / ' + duration;
+                
+                // Animate visualization bars
+                const bars = visualization.querySelectorAll('.audio-bar');
+                if (audio.paused) {
+                    for (var i = 0; i < bars.length; i++) {
+                        bars[i].style.height = Math.floor(Math.random() * 20 + 5) + 'px';
+                    }
+                } else {
+                    for (var i = 0; i < bars.length; i++) {
+                        bars[i].style.height = Math.floor(Math.random() * 70 + 10) + 'px';
+                    }
+                }
+            });
+              
+              audio.addEventListener('progress', function() {
+                // Update buffered progress
+                if (audio.buffered.length > 0) {
+                    const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
+                    const duration = audio.duration;
+                    const percent = (bufferedEnd / duration) * 100;
+                    bufferedBar.style.width = percent + '%';
+                }
+            });
+              audio.addEventListener('play', () => {
+                  playBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                  
+                  // Animate visualization
+                  const bars = visualization.querySelectorAll('.audio-bar');
+                  bars.forEach(bar => {
+                      const randomHeight = Math.floor(Math.random() * 70 + 10);
+                      bar.style.height = randomHeight + 'px';
+                  });
+              });
+              
+              audio.addEventListener('pause', () => {
+                  playBtn.innerHTML = '<i class="fas fa-play"></i>';
+                  
+                  // Reduce visualization height
+                  const bars = visualization.querySelectorAll('.audio-bar');
+                  bars.forEach(bar => {
+                      const randomHeight = Math.floor(Math.random() * 20 + 5);
+                      bar.style.height = randomHeight + 'px';
+                  });
+              });
+              
+              audio.addEventListener('ended', () => {
+                  playBtn.innerHTML = '<i class="fas fa-play"></i>';
+                  
+                  // If not looping, try to play next audio
+                  if (!playerSettings.loop) {
+                      // Find next audio file
+                      const fileCards = Array.from(document.querySelectorAll('.file-card'));
+                      const audioFiles = fileCards.filter(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          return fileData.contentType.startsWith('audio/');
+                      });
+                      
+                      if (audioFiles.length > 1) {
+                          const currentIndex = audioFiles.findIndex(card => {
+                              const fileData = JSON.parse(card.getAttribute('data-file'));
+                              return fileData.url === audioUrl;
+                          });
+                          
+                          if (currentIndex !== -1) {
+                              const nextIndex = (currentIndex + 1) % audioFiles.length;
+                              const nextFileData = JSON.parse(audioFiles[nextIndex].getAttribute('data-file'));
+                              
+                              // Open next audio
+                              if (playerSettings.autoplay) {
+                                  openFileViewer(nextFileData);
+                              }
+                          }
+                      }
+                  }
+              });
+              
+              // Play/pause button click
+              playBtn.addEventListener('click', () => {
+                  if (audio.paused) {
+                      audio.play();
+                  } else {
+                      audio.pause();
+                  }
+              });
+              
+              // Volume button click
+              volumeBtn.addEventListener('click', () => {
+                  if (audio.muted) {
+                      audio.muted = false;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+                      volumeLevel.style.width = (playerSettings.volume * 100) + '%';
+                  } else {
+                      audio.muted = true;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                      volumeLevel.style.width = '0%';
+                  }
+                  
+                  playerSettings.muted = audio.muted;
+                  savePlayerSettings();
+              });
+              
+              // Volume slider
+              volumeSlider.addEventListener('click', (e) => {
+                  const rect = volumeSlider.getBoundingClientRect();
+                  const pos = (e.clientX - rect.left) / rect.width;
+                  const volume = Math.max(0, Math.min(1, pos));
+                  
+                  audio.volume = volume;
+                  volumeLevel.style.width = (volume * 100) + '%';
+                  
+                  if (volume === 0) {
+                      audio.muted = true;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-mute"></i>';
+                  } else {
+                      audio.muted = false;
+                      volumeBtn.innerHTML = '<i class="fas fa-volume-up"></i>';
+                  }
+                  
+                  playerSettings.volume = volume;
+                  playerSettings.muted = audio.muted;
+                  savePlayerSettings();
+              });
+              
+              // Progress bar click
+              progressContainer.addEventListener('click', (e) => {
+                  const rect = progressContainer.getBoundingClientRect();
+                  const pos = (e.clientX - rect.left) / rect.width;
+                  audio.currentTime = pos * audio.duration;
+              });
+              
+              // Loop button click
+              loopBtn.addEventListener('click', () => {
+                  audio.loop = !audio.loop;
+                  loopBtn.classList.toggle('active');
+                  
+                  playerSettings.loop = audio.loop;
+                  savePlayerSettings();
+              });
+              
+              // Previous/Next buttons
+              prevBtn.addEventListener('click', () => {
+                  // Find previous audio file
+                  const fileCards = Array.from(document.querySelectorAll('.file-card'));
+                  const audioFiles = fileCards.filter(card => {
+                      const fileData = JSON.parse(card.getAttribute('data-file'));
+                      return fileData.contentType.startsWith('audio/');
+                  });
+                  
+                  if (audioFiles.length > 1) {
+                      const currentIndex = audioFiles.findIndex(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          return fileData.url === audioUrl;
+                      });
+                      
+                      if (currentIndex !== -1) {
+                          const prevIndex = (currentIndex - 1 + audioFiles.length) % audioFiles.length;
+                          const prevFileData = JSON.parse(audioFiles[prevIndex].getAttribute('data-file'));
+                          
+                          // Open previous audio
+                          openFileViewer(prevFileData);
+                      }
+                  }
+              });
+              
+              nextBtn.addEventListener('click', () => {
+                  // Find next audio file
+                  const fileCards = Array.from(document.querySelectorAll('.file-card'));
+                  const audioFiles = fileCards.filter(card => {
+                      const fileData = JSON.parse(card.getAttribute('data-file'));
+                      return fileData.contentType.startsWith('audio/');
+                  });
+                  
+                  if (audioFiles.length > 1) {
+                      const currentIndex = audioFiles.findIndex(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          return fileData.url === audioUrl;
+                      });
+                      
+                      if (currentIndex !== -1) {
+                          const nextIndex = (currentIndex + 1) % audioFiles.length;
+                          const nextFileData = JSON.parse(audioFiles[nextIndex].getAttribute('data-file'));
+                          
+                          // Open next audio
+                          openFileViewer(nextFileData);
+                      }
+                  }
+              });
+              
+              return playerContainer;
+          }
+          
+            function formatTime(seconds) {
+                if (isNaN(seconds)) return '0:00';
+                const minutes = Math.floor(seconds / 60);
+                const secs = Math.floor(seconds % 60);
+                return minutes + ':' + (secs < 10 ? '0' : '') + secs;
+            }
+          // Helper function to format file size
+          function formatSize(bytes) {
+              if (bytes === 0) return '0 Bytes';
+              const k = 1024;
+              const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+              const i = Math.floor(Math.log(bytes) / Math.log(k));
+              return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+          }
+          
+          // Save player settings
+          function savePlayerSettings() {
+              localStorage.setItem('playerSettings', JSON.stringify(playerSettings));
+          }
+          
+          // Load player settings
+          function loadPlayerSettings() {
+              const savedSettings = localStorage.getItem('playerSettings');
+              if (savedSettings) {
+                  playerSettings = JSON.parse(savedSettings);
+              }
+          }
+          
+          // Load settings on page load
+          loadPlayerSettings();
+          
           // Open file viewer
           function openFileViewer(fileData) {
               currentFile = fileData;
@@ -2164,14 +3682,9 @@ function generateHTML(accountList, allFiles) {
               const contentType = fileData.contentType;
               
               if (contentType.startsWith('video/')) {
-                  // Simple video player for Cloudflare Worker environment
-                  const video = document.createElement('video');
-                  video.controls = true;
-                  video.style.width = '100%';
-                  video.style.maxHeight = '80vh';
-                  video.style.borderRadius = '8px';
-                  video.src = fileData.url;
-                  fileViewerBody.appendChild(video);
+                  // Enhanced video player
+                  const videoPlayer = createEnhancedVideoPlayer(fileData.url, fileData.title);
+                  fileViewerBody.appendChild(videoPlayer);
               } else if (contentType.startsWith('image/')) {
                   const img = document.createElement('img');
                   img.src = fileData.url;
@@ -2181,20 +3694,17 @@ function generateHTML(accountList, allFiles) {
                   img.style.borderRadius = '8px';
                   fileViewerBody.appendChild(img);
               } else if (contentType.startsWith('audio/')) {
-                  const audio = document.createElement('audio');
-                  audio.controls = true;
-                  audio.style.width = '100%';
-                  audio.style.margin = '20px 0';
-                  audio.src = fileData.url;
-                  fileViewerBody.appendChild(audio);
+                  // Enhanced audio player
+                  const audioPlayer = createEnhancedAudioPlayer(fileData.url, fileData.title);
+                  fileViewerBody.appendChild(audioPlayer);
               } else {
-                    // For other file types, show a download prompt
-                    fileViewerBody.innerHTML = 
-                        '<div style="padding: 40px; text-align: center;">' +
-                            '<i class="fas fa-file-alt" style="font-size: 4rem; color: var(--accent-color); margin-bottom: 20px;"></i>' +
-                            '<p>This file type cannot be previewed directly.</p>' +
-                            '<p>Click the download button below to access the file.</p>' +
-                        '</div>';
+                  // For other file types, show a download prompt
+                  fileViewerBody.innerHTML = 
+                      '<div style="padding: 40px; text-align: center;">' +
+                          '<i class="fas fa-file-alt" style="font-size: 4rem; color: var(--accent-color); margin-bottom: 20px;"></i>' +
+                          '<p>This file type cannot be previewed directly.</p>' +
+                          '<p>Click the download button below to access the file.</p>' +
+                      '</div>';
               }
               
               fileViewerModal.style.display = 'block';
@@ -2208,6 +3718,12 @@ function generateHTML(accountList, allFiles) {
               // Stop video/audio if playing
               const mediaElements = fileViewerBody.querySelectorAll('video, audio');
               mediaElements.forEach(media => media.pause());
+              
+              // Exit fullscreen if active
+              const player = document.querySelector('.enhanced-media-player');
+              if (player && player.classList.contains('fullscreen')) {
+                  player.classList.remove('fullscreen');
+              }
           });
           
           // Share button functionality
@@ -2238,6 +3754,86 @@ function generateHTML(accountList, allFiles) {
               document.body.removeChild(textarea);
               showToast('success', 'Link copied to clipboard!');
           }
+          
+          // Rename button functionality
+          renameFileBtn.addEventListener('click', () => {
+              if (currentFile) {
+                  newFileName.value = currentFile.title;
+                  renameModal.style.display = 'block';
+              }
+          });
+          
+          // Cancel rename
+          cancelRenameBtn.addEventListener('click', () => {
+              renameModal.style.display = 'none';
+          });
+          
+          // Confirm rename
+          confirmRenameBtn.addEventListener('click', async () => {
+              if (!currentFile || !newFileName.value.trim()) return;
+              
+              confirmRenameBtn.disabled = true;
+              confirmRenameBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Renaming...';
+              
+              try {
+                  const response = await fetch('/rename-file', {
+                      method: 'POST',
+                      headers: {
+                          'Content-Type': 'application/json'
+                      },
+                      body: JSON.stringify({
+                          account: currentFile.account,
+                          fileId: currentFile.fileId,
+                          oldFileName: currentFile.fileName,
+                          newTitle: newFileName.value.trim()
+                      })
+                  });
+                  
+                  if (response.ok) {
+                      const result = await response.json();
+                      showToast('success', 'File renamed successfully!');
+                      
+                      // Close modal
+                      renameModal.style.display = 'none';
+                      
+                      // Update file viewer title
+                      fileViewerTitle.textContent = newFileName.value.trim();
+                      
+                      // Update current file data
+                      currentFile.title = newFileName.value.trim();
+                      currentFile.fileName = result.newFileName;
+                      currentFile.fileId = result.newFileId;
+                      currentFile.url = result.url;
+                      
+                      // Update download link
+                      downloadFileBtn.href = result.url;
+                      
+                      // Update file card
+                      const fileCards = document.querySelectorAll('.file-card');
+                      fileCards.forEach(card => {
+                          const fileData = JSON.parse(card.getAttribute('data-file'));
+                          if (fileData.fileId === currentFile.fileId) {
+                              fileData.title = newFileName.value.trim();
+                              fileData.fileName = result.newFileName;
+                              fileData.fileId = result.newFileId;
+                              fileData.url = result.url;
+                              
+                              card.setAttribute('data-file', JSON.stringify(fileData));
+                              card.querySelector('.file-name').textContent = newFileName.value.trim();
+                          }
+                      });
+                      
+                  } else {
+                      const error = await response.json();
+                      showToast('error', 'Error renaming file: ' + error.message);
+                  }
+              } catch (error) {
+                  showToast('error', 'Error renaming file: ' + error.message);
+              }
+              
+              confirmRenameBtn.disabled = false;
+              confirmRenameBtn.innerHTML = 'Rename';
+          });
           
           // Delete file functionality
           deleteFileBtn.addEventListener('click', () => {
