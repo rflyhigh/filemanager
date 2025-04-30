@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="main-header">
+      <h1><%= title %></h1>
+      <div class="header-actions">
+        <button id="uploadBtn" class="btn primary">
+          <span class="material-icons">cloud_upload</span> Upload
+        </button>
+        <button id="createFolderBtn" class="btn secondary">
+          <span class="material-icons">create_new_folder</span> New Folder
+        </button>
+        <button id="moveFilesBtn" class="btn secondary" disabled>
+          <span class="material-icons">drive_file_move</span> Move Files
+        </button>
+      </div>
+    </header>
+
+    <div class="breadcrumb">
+      <a href="/" class="breadcrumb-item">
+        <span class="material-icons">home</span> Home
+      </a>
+      <% if (folderId === 'root') { %>
+        <span class="breadcrumb-separator">/</span>
+        <span class="breadcrumb-item active">All Files</span>
+      <% } else { %>
+        <span class="breadcrumb-separator">/</span>
+        <a href="/folder/root" class="breadcrumb-item">All Files</a>
+        <% breadcrumb.forEach(item => { %>
+          <span class="breadcrumb-separator">/</span>
+          <% if (item.id === folderId) { %>
+            <span class="breadcrumb-item active"><%= item.name %></span>
+          <% } else { %>
+            <a href="/folder/<%= item.id %>" class="breadcrumb-item"><%= item.name %></a>
+          <% } %>
+        <% }); %>
+      <% } %>
+    </div>
+
+    <div class="folder-controls">
+      <div class="filter-controls">
+        <select id="typeFilter" class="filter-select">
+          <option value="all">All Types</option>
+          <option value="video">Videos</option>
+          <option value="image">Images</option>
+          <option value="audio">Audio</option>
+          <option value="document">Documents</option>
+        </select>
+        <select id="sortFilter" class="filter-select">
+          <option value="newest">Newest First</option>
+          <option value="oldest">Oldest First</option>
+          <option value="name">Name</option>
+          <option value="size">Size</option>
+        </select>
+      </div>
+      <div class="selection-controls">
+        <span id="selectedCount" class="selected-count" style="display: none;">0 selected</span>
+        <button id="selectAllBtn" class="btn secondary">
+          <span class="material-icons">select_all</span> Select All
+        </button>
+        <button id="deselectAllBtn" class="btn secondary" style="display: none;">
+          <span class="material-icons">clear_all</span> Deselect All
+        </button>
+        <div class="view-toggle">
+          <button class="view-btn active" data-view="grid">
+            <span class="material-icons">grid_view</span>
+          </button>
+          <button class="view-btn" data-view="list">
+            <span class="material-icons">view_list</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <% if (folders.length > 0) { %>
+      <div class="folders-section">
+        <h2>Folders</h2>
+        <div class="folder-grid">
+          <% folders.forEach(folder => { %>
+            <div class="folder-card">
+              <a href="/folder/<%= folder._id %>" class="folder-link">
+                <span class="material-icons">folder</span>
+                <div class="folder-info">
+                  <div class="folder-name"><%= folder.name %></div>
+                  <div class="folder-meta">
+                    <span><%= folder.account %></span>
+                  </div>
+                </div>
+              </a>
+              <div class="folder-actions">
+                <button class="folder-action-btn rename-folder" data-id="<%= folder._id %>" data-name="<%= folder.name %>">
+                  <span class="material-icons">edit</span>
+                </button>
+                <button class="folder-action-btn delete-folder" data-id="<%= folder._id %>">
+                  <span class="material-icons">delete</span>
+                </button>
+              </div>
+            </div>
+          <% }); %>
+        </div>
+      </div>
+    <% } %>
+
+    <div class="files-section">
+      <h2>Files</h2>
+      <div class="file-grid" id="fileGrid">
+        <% if (files.length === 0) { %>
+          <div class="empty-message">No files found in this folder.</div>
+        <% } else { %>
+          <% files.forEach(file => { 
+            const isVideo = file.contentType.startsWith('video/');
+            const isImage = file.contentType.startsWith('image/');
+            const isAudio = file.contentType.startsWith('audio/');
+            const fileClass = isVideo ? 'video' : (isImage ? 'image' : (isAudio ? 'audio' : 'document'));
+            const fileIcon = isVideo ? 'videocam' : (isImage ? 'image' : (isAudio ? 'audiotrack' : 'insert_drive_file'));
+            const fileType = isVideo ? 'video' : (isImage ? 'image' : (isAudio ? 'audio' : 'document'));
+          %>
+            <div class="file-card" data-type="<%= fileType %>" data-size="<%= file.size %>" data-timestamp="<%= file.uploadTimestamp %>">
+              <div class="file-checkbox">
+                <input type="checkbox" class="file-select" data-id="<%= file._id %>">
+              </div>
+              <div class="file-thumbnail <%= fileClass %>">
+                <% if (isImage || (isVideo && file.thumbnailUrl)) { %>
+                  <img src="<%= isImage ? file.url : file.thumbnailUrl %>" alt="<%= file.title %>">
+                <% } else { %>
+                  <span class="material-icons"><%= fileIcon %></span>
+                <% } %>
+                <div class="file-account-badge"><%= file.account %></div>
+              </div>
+              <div class="file-info">
+                <div class="file-name"><%= file.title %></div>
+                <div class="file-meta">
+                  <span><%= formatSize(file.size) %></span>
+                  <span><%= new Date(file.uploadTimestamp).toLocaleDateString() %></span>
+                </div>
+              </div>
+              <div class="file-actions">
+                <a href="/file/<%= file._id %>" class="file-action-btn">
+                  <span class="material-icons">visibility</span>
+                </a>
+                <a href="<%= file.url %>" class="file-action-btn" target="_blank" download>
+                  <span class="material-icons">download</span>
+                </a>
+                <button class="file-action-btn rename-file" data-id="<%= file._id %>" data-title="<%= file.title %>">
+                  <span class="material-icons">edit</span>
+                </button>
+                <button class="file-action-btn delete-file" data-id="<%= file._id %>">
+                  <span class="material-icons">delete</span>
+                </button>
+              </div>
+            </div>
+          <% }); %>
+        <% } %>
+      </div>
+    </div>
+  </div>
+
+  <!-- Upload Modal -->
+  <div class="modal" id="uploadModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Upload Files</h3>
+        <button class="close-btn" id="closeUploadBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="alert success" id="successAlert">File uploaded successfully!</div>
+        <div class="alert error" id="errorAlert">Error uploading file.</div>
+        
+        <form id="uploadForm">
+          <div class="form-group">
+            <label for="accountSelect">Account</label>
+            <select id="accountSelect" name="account" required>
+              <option value="">Select Account</option>
+              <% accounts.forEach(account => { %>
+                <option value="<%= account %>"><%= account %></option>
+              <% }); %>
+            </select>
+          </div>
+          
+          <div class="form-group">
+            <label for="fileTitle">Title (Optional - will use filename if empty)</label>
+            <input type="text" id="fileTitle" name="title" placeholder="Enter file title">
+          </div>
+          
+          <div class="form-group">
+            <label for="folderSelect">Folder</label>
+            <select id="folderSelect" name="folderId">
+              <option value="null">Root Folder</option>
+              <% if (currentFolder) { %>
+                <option value="<%= currentFolder._id %>" selected>Current Folder</option>
+              <% } %>
+            </select>
+          </div>
+          
+          <div class="file-input-container">
+            <label for="fileUpload" class="file-input-label" id="fileInputLabel">
+              <span class="material-icons">cloud_upload</span>
+              <span>Choose files or drag them here</span>
+              <input type="file" id="fileUpload" name="file" class="file-input" multiple>
+            </label>
+            <div id="fileNameDisplay" class="file-name-display"></div>
+          </div>
+          
+          <div id="progressContainer" class="progress-container">
+            <div class="progress-bar-container">
+              <div id="progressBar" class="progress-bar"></div>
+            </div>
+            <div id="progressText" class="progress-text">0%</div>
+          </div>
+          
+          <div class="modal-actions">
+            <button type="button" class="btn secondary" id="closeUploadBtn">Cancel</button>
+            <button type="submit" class="btn primary">Upload</button>
+          </div>
+        </form>
+        
+        <div id="uploadQueueContainer" class="upload-queue-container" style="display: none;">
+          <h4>Upload Queue</h4>
+          <div id="uploadQueue" class="upload-queue"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Folder Modal -->
+  <div class="modal" id="folderModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Create New Folder</h3>
+        <button class="close-btn" id="closeFolderBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="alert success" id="folderSuccessAlert">Folder created successfully!</div>
+        <div class="alert error" id="folderErrorAlert">Error creating folder.</div>
+        
+        <form id="folderForm">
+          <div class="form-group">
+            <label for="folderName">Folder Name</label>
+            <input type="text" id="folderName" name="name" placeholder="Enter folder name" required>
+          </div>
+          
+          <div class="form-group">
+            <label for="parentFolderSelect">Parent Folder</label>
+            <select id="parentFolderSelect" name="parent">
+              <option value="null">Root Folder</option>
+              <% if (currentFolder) { %>
+                <option value="<%= currentFolder._id %>" selected>Current Folder</option>
+              <% } %>
+            </select>
+          </div>
+          
+          <div class="modal-actions">
+            <button type="button" class="btn secondary" id="closeFolderBtn">Cancel</button>
+            <button type="submit" class="btn primary" id="createFolderSubmitBtn">Create Folder</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename Modal -->
+  <div class="modal" id="renameModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="renameModalTitle">Rename</h3>
+        <button class="close-btn" id="closeRenameBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="alert success" id="renameSuccessAlert">Item renamed successfully!</div>
+        <div class="alert error" id="renameErrorAlert">Error renaming item.</div>
+        
+        <form id="renameForm">
+          <input type="hidden" id="renameItemId" value="">
+          <input type="hidden" id="renameItemType" value="">
+          
+          <div class="form-group">
+            <label for="newName">New Name</label>
+            <input type="text" id="newName" name="newName" placeholder="Enter new name" required>
+          </div>
+          
+          <div class="modal-actions">
+            <button type="button" class="btn secondary" id="closeRenameBtn">Cancel</button>
+            <button type="submit" class="btn primary" id="renameSubmitBtn">Rename</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirmation Modal -->
+  <div class="modal" id="deleteModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="deleteModalTitle">Delete</h3>
+        <button class="close-btn" id="closeDeleteBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="deleteModalMessage">Are you sure you want to delete this item? This action cannot be undone.</p>
+        <div class="modal-actions">
+          <button class="btn secondary" id="cancelDeleteBtn">Cancel</button>
+          <button class="btn danger" id="confirmDeleteBtn" data-id="" data-type="">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Move Files Modal -->
+  <div class="modal" id="moveModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Move Files</h3>
+        <button class="close-btn" id="closeMoveBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="alert success" id="moveSuccessAlert">Files moved successfully!</div>
+        <div class="alert error" id="moveErrorAlert">Error moving files.</div>
+        
+        <p>Select destination folder:</p>
+        <div class="folder-tree" id="folderTree">
+          <div class="folder-tree-item" data-id="null">
+            <span class="material-icons">folder</span>
+            <span>Root Folder</span>
+          </div>
+        </div>
+        
+        <div class="modal-actions">
+          <button class="btn secondary" id="cancelMoveBtn">Cancel</button>
+          <button class="btn primary" id="confirmMoveBtn">Move</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/js/main.js"></script>
+</body>
+</html>

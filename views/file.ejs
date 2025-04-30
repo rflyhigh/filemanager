@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+  <!-- Fix the Player.js script by using a CDN that works -->
+  <script src="https://cdn.jsdelivr.net/npm/@vimeo/player@2.18.0/dist/player.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header class="main-header">
+      <h1><%= title %></h1>
+      <div class="header-actions">
+        <% if (file.folder) { %>
+          <a href="/folder/<%= file.folder %>" class="btn secondary">
+            <span class="material-icons">arrow_back</span> Back to Folder
+          </a>
+        <% } else { %>
+          <a href="/folder/root" class="btn secondary">
+            <span class="material-icons">arrow_back</span> Back to Files
+          </a>
+        <% } %>
+        <a href="<%= file.url %>" class="btn primary" target="_blank" download>
+          <span class="material-icons">download</span> Download
+        </a>
+        <button class="btn secondary rename-file" data-id="<%= file._id %>" data-title="<%= file.title %>">
+          <span class="material-icons">edit</span> Rename
+        </button>
+        <button class="btn danger delete-file" data-id="<%= file._id %>">
+          <span class="material-icons">delete</span> Delete
+        </button>
+      </div>
+    </header>
+
+    <div class="breadcrumb">
+      <a href="/" class="breadcrumb-item">
+        <span class="material-icons">home</span> Home
+      </a>
+      <span class="breadcrumb-separator">/</span>
+      <a href="/folder/root" class="breadcrumb-item">All Files</a>
+      <% breadcrumb.forEach(item => { %>
+        <span class="breadcrumb-separator">/</span>
+        <a href="/folder/<%= item.id %>" class="breadcrumb-item"><%= item.name %></a>
+      <% }); %>
+      <span class="breadcrumb-separator">/</span>
+      <span class="breadcrumb-item active"><%= file.title %></span>
+    </div>
+
+    <div class="file-details">
+      <div class="file-metadata">
+        <div class="metadata-item">
+          <span class="metadata-label">Size</span>
+          <span class="metadata-value"><%= formatSize(file.size) %></span>
+        </div>
+        <div class="metadata-item">
+          <span class="metadata-label">Type</span>
+          <span class="metadata-value"><%= file.contentType %></span>
+        </div>
+        <% if (file.duration) { %>
+          <div class="metadata-item">
+            <span class="metadata-label">Duration</span>
+            <span class="metadata-value"><%= formatTime(file.duration) %></span>
+          </div>
+        <% } %>
+        <div class="metadata-item">
+          <span class="metadata-label">Uploaded</span>
+          <span class="metadata-value"><%= new Date(file.uploadTimestamp).toLocaleString() %></span>
+        </div>
+        <div class="metadata-item">
+          <span class="metadata-label">Account</span>
+          <span class="metadata-value"><%= file.account %></span>
+        </div>
+      </div>
+
+      <div class="file-preview">
+        <% if (file.contentType.startsWith('video/')) { %>
+          <div class="video-container">
+            <!-- Direct embed of the video file using a simple video tag -->
+            <video 
+              id="videoPlayer" 
+              controls 
+              preload="auto"
+              poster="<%= file.thumbnailUrl || '' %>"
+              style="width:100%; height:100%; position:absolute; top:0; left:0;">
+              <source src="<%= file.url %>" type="<%= file.contentType %>">
+              Your browser does not support the video tag.
+            </video>
+          </div>
+          <div class="player-options">
+            <div class="player-option">
+              <label>Autoplay</label>
+              <label class="switch">
+                <input type="checkbox" id="autoplayOption">
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="player-option">
+              <label>Loop</label>
+              <label class="switch">
+                <input type="checkbox" id="loopOption">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        <% } else if (file.contentType.startsWith('image/')) { %>
+          <div class="image-container">
+            <img src="<%= file.url %>" alt="<%= file.title %>" class="preview-image">
+          </div>
+        <% } else if (file.contentType.startsWith('audio/')) { %>
+          <div class="audio-container">
+            <!-- Direct embed of the audio file using a simple audio tag -->
+            <audio 
+              id="audioPlayer" 
+              controls 
+              style="width:100%;">
+              <source src="<%= file.url %>" type="<%= file.contentType %>">
+              Your browser does not support the audio element.
+            </audio>
+          </div>
+          <div class="player-options">
+            <div class="player-option">
+              <label>Autoplay</label>
+              <label class="switch">
+                <input type="checkbox" id="autoplayOption">
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="player-option">
+              <label>Loop</label>
+              <label class="switch">
+                <input type="checkbox" id="loopOption">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        <% } else { %>
+          <div class="document-preview">
+            <div class="document-icon">
+              <span class="material-icons">
+                <% if (file.contentType.includes('pdf')) { %>
+                  picture_as_pdf
+                <% } else if (file.contentType.includes('word') || file.contentType.includes('document')) { %>
+                  description
+                <% } else if (file.contentType.includes('spreadsheet') || file.contentType.includes('excel')) { %>
+                  table_chart
+                <% } else if (file.contentType.includes('presentation') || file.contentType.includes('powerpoint')) { %>
+                  slideshow
+                <% } else { %>
+                  insert_drive_file
+                <% } %>
+              </span>
+            </div>
+            <p>This file type cannot be previewed directly.</p>
+            <a href="<%= file.url %>" class="btn primary" target="_blank" download>
+              <span class="material-icons">download</span> Download to View
+            </a>
+          </div>
+        <% } %>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename Modal -->
+  <div class="modal" id="renameModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="renameModalTitle">Rename File</h3>
+        <button class="close-btn" id="closeRenameBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="alert success" id="renameSuccessAlert">File renamed successfully!</div>
+        <div class="alert error" id="renameErrorAlert">Error renaming file.</div>
+        
+        <form id="renameForm">
+          <input type="hidden" id="renameItemId" value="<%= file._id %>">
+          <input type="hidden" id="renameItemType" value="file">
+          
+          <div class="form-group">
+            <label for="newName">New Name:</label>
+            <input type="text" id="newName" name="newName" value="<%= file.title %>" placeholder="Enter new name" required>
+          </div>
+          
+          <div class="modal-actions">
+            <button type="button" class="btn secondary" id="closeRenameBtn">Cancel</button>
+            <button type="submit" class="btn primary" id="renameSubmitBtn">Rename</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirmation Modal -->
+  <div class="modal" id="deleteModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="deleteModalTitle">Delete File</h3>
+        <button class="close-btn" id="closeDeleteBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="deleteModalMessage">Are you sure you want to delete this file? This action cannot be undone.</p>
+        <div class="modal-actions">
+          <button class="btn secondary" id="cancelDeleteBtn">Cancel</button>
+          <button class="btn danger" id="confirmDeleteBtn" data-id="<%= file._id %>" data-type="file">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/js/main.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      // Handle video player
+      const videoElement = document.getElementById('videoPlayer');
+      if (videoElement) {
+        // Set up autoplay and loop from localStorage
+        const autoplayToggle = document.getElementById('autoplayOption');
+        const loopToggle = document.getElementById('loopOption');
+        
+        if (autoplayToggle) {
+          const savedAutoplay = localStorage.getItem('autoplay') === 'true';
+          autoplayToggle.checked = savedAutoplay;
+          videoElement.autoplay = savedAutoplay;
+          
+          if (savedAutoplay) {
+            // Try to play the video
+            const playPromise = videoElement.play();
+            
+            if (playPromise !== undefined) {
+              playPromise.then(_ => {
+                // Autoplay started successfully
+                console.log('Autoplay started');
+              }).catch(error => {
+                // Autoplay was prevented
+                console.log('Autoplay prevented:', error);
+                // Most browsers require user interaction before autoplay
+                autoplayToggle.checked = false;
+              });
+            }
+          }
+          
+          autoplayToggle.addEventListener('change', function() {
+            localStorage.setItem('autoplay', this.checked);
+            if (this.checked) {
+              videoElement.play();
+            } else {
+              videoElement.pause();
+            }
+          });
+        }
+        
+        if (loopToggle) {
+          const savedLoop = localStorage.getItem('loop') === 'true';
+          loopToggle.checked = savedLoop;
+          videoElement.loop = savedLoop;
+          
+          loopToggle.addEventListener('change', function() {
+            localStorage.setItem('loop', this.checked);
+            videoElement.loop = this.checked;
+          });
+        }
+      }
+      
+      // Handle audio player
+      const audioElement = document.getElementById('audioPlayer');
+      if (audioElement) {
+        // Set up autoplay and loop from localStorage
+        const autoplayToggle = document.getElementById('autoplayOption');
+        const loopToggle = document.getElementById('loopOption');
+        
+        if (autoplayToggle) {
+          const savedAutoplay = localStorage.getItem('autoplay') === 'true';
+          autoplayToggle.checked = savedAutoplay;
+          audioElement.autoplay = savedAutoplay;
+          
+          if (savedAutoplay) {
+            // Try to play the audio
+            const playPromise = audioElement.play();
+            
+            if (playPromise !== undefined) {
+              playPromise.then(_ => {
+                // Autoplay started successfully
+                console.log('Autoplay started');
+              }).catch(error => {
+                // Autoplay was prevented
+                console.log('Autoplay prevented:', error);
+                // Most browsers require user interaction before autoplay
+                autoplayToggle.checked = false;
+              });
+            }
+          }
+          
+          autoplayToggle.addEventListener('change', function() {
+            localStorage.setItem('autoplay', this.checked);
+            if (this.checked) {
+              audioElement.play();
+            } else {
+              audioElement.pause();
+            }
+          });
+        }
+        
+        if (loopToggle) {
+          const savedLoop = localStorage.getItem('loop') === 'true';
+          loopToggle.checked = savedLoop;
+          audioElement.loop = savedLoop;
+          
+          loopToggle.addEventListener('change', function() {
+            localStorage.setItem('loop', this.checked);
+            audioElement.loop = this.checked;
+          });
+        }
+      }
+    });
+  </script>
+</body>
+</html>
