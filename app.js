@@ -441,7 +441,16 @@ app.get('/folder/:id', async (req, res) => {
     res.status(500).send('Internal Server Error: ' + error.message);
   }
 });
-
+// Simple health check endpoint
+app.get('/health', (req, res) => {
+  const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+  
+  res.json({
+    status: 'ok',
+    mongodb: mongoStatus,
+    timestamp: new Date().toISOString()
+  });
+});
 // File view
 app.get('/file/:id', async (req, res) => {
   try {
